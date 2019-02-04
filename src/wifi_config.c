@@ -20,10 +20,14 @@
 #define WIFI_CONFIG_CONNECT_TIMEOUT 15000
 #endif
 
+#define AP_TIMEOUT 600   //Access point timeout (in seconds) if no WiFi network is selected
+
 #define DEBUG(message, ...) printf(">>> wifi_config: %s: " message "\n", __func__, ##__VA_ARGS__);
 #define INFO(message, ...) printf(">>> wifi_config: " message "\n", ##__VA_ARGS__);
 #define ERROR(message, ...) printf("!!! wifi_config: " message "\n", ##__VA_ARGS__);
 
+ETSTimer r_timer;  //1 sec remaining timer
+uint32_t try_to_reconnect = 0;
 
 typedef enum {
     ENDPOINT_UNKNOWN = 0,
@@ -536,8 +540,23 @@ static void wifi_config_context_free(wifi_config_context_t *context) {
     free(context);
 }
 
+static void wifi_config_re_connect() {
+    try_to_reconnect--;
+    if (try_to_reconnect == 0) {
+        sdk_os_timer_disarm(&r_timer);
+        if (wifi_config_station_connect()) {
+            wifi_config_softap_start();
+        }
+    }
+}
+
 static void wifi_config_softap_start() {
     INFO("Starting AP mode");
+    
+    //Setup network reconnect timeout
+    try_to_reconnect = AP_TIMEOUT;
+    sdk_os_timer_setfn(&r_timer, wifi_config_re_connect, NULL);
+    sdk_os_timer_arm(&r_timer, 1000, 1);
 
     sdk_wifi_set_opmode(STATIONAP_MODE);
 
@@ -603,6 +622,7 @@ static void wifi_config_sta_connect_timeout_callback(void *arg) {
         // Connected to station, all is dandy
         DEBUG("Successfully connected");
         sdk_os_timer_disarm(&context->sta_connect_timeout);
+        sdk_os_timer_disarm(&r_timer);
 
         wifi_config_softap_stop();
         if (context->on_wifi_ready)
