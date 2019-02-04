@@ -27,7 +27,8 @@
 #define ERROR(message, ...) printf("!!! wifi_config: " message "\n", ##__VA_ARGS__);
 
 ETSTimer r_timer;  //1 sec remaining timer
-uint32_t try_to_reconnect = 0;
+uint32_t try_to_reconnect = AP_TIMEOUT;
+bool tmr = 0;
 
 typedef enum {
     ENDPOINT_UNKNOWN = 0,
@@ -543,20 +544,25 @@ static void wifi_config_context_free(wifi_config_context_t *context) {
 static void wifi_config_re_connect() {
     try_to_reconnect--;
     if (try_to_reconnect == 0) {
+        try_to_reconnect = AP_TIMEOUT;
         sdk_os_timer_disarm(&r_timer);
+        printf("r_timer - time is up\n");
         if (wifi_config_station_connect()) {
             wifi_config_softap_start();
+            tmr = 1;
         }
     }
 }
 
 static void wifi_config_softap_start() {
     INFO("Starting AP mode");
-    
-    //Setup network reconnect timeout
-    try_to_reconnect = AP_TIMEOUT;
-    sdk_os_timer_setfn(&r_timer, wifi_config_re_connect, NULL);
-    sdk_os_timer_arm(&r_timer, 1000, 1);
+
+    if (tmr == 0) {
+      //Setup network reconnect timeout
+      sdk_os_timer_setfn(&r_timer, wifi_config_re_connect, NULL);
+      sdk_os_timer_arm(&r_timer, 1000, 1);
+      printf("r_timer started\n");
+    }
 
     sdk_wifi_set_opmode(STATIONAP_MODE);
 
@@ -640,6 +646,7 @@ static void wifi_config_sta_connect_timeout_callback(void *arg) {
     sdk_os_timer_disarm(&context->sta_connect_timeout);
     DEBUG("Timeout connecting to WiFi network, starting config AP");
     // Not connected to station, launch configuration AP
+    tmr = 0;
     wifi_config_softap_start();
 }
 
@@ -700,6 +707,7 @@ void wifi_config_init(const char *ssid_prefix, const char *password, void (*on_w
     context->on_wifi_ready = on_wifi_ready;
 
     if (wifi_config_station_connect()) {
+        tmr = 0;
         wifi_config_softap_start();
     }
 }
