@@ -12,6 +12,7 @@
 #include <http-parser/http_parser.h>
 #include <dhcpserver.h>
 
+#include "wifi_config.h"
 #include "form_urlencoded.h"
 
 #define WIFI_CONFIG_SERVER_PORT 80
@@ -19,16 +20,22 @@
 #ifndef WIFI_CONFIG_CONNECT_TIMEOUT
 #define WIFI_CONFIG_CONNECT_TIMEOUT 15000
 #endif
+#ifndef WIFI_CONFIG_CONNECTED_MONITOR_INTERVAL
+#define WIFI_CONFIG_CONNECTED_MONITOR_INTERVAL 30000
+#endif
+#ifndef WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL
+#define WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL 10000
+#endif
 
-#define AP_TIMEOUT 600   //Access point timeout (in seconds) if no WiFi network is selected
-
-#define DEBUG(message, ...) printf(">>> wifi_config: %s: " message "\n", __func__, ##__VA_ARGS__);
 #define INFO(message, ...) printf(">>> wifi_config: " message "\n", ##__VA_ARGS__);
 #define ERROR(message, ...) printf("!!! wifi_config: " message "\n", ##__VA_ARGS__);
 
-ETSTimer r_timer;  //1 sec remaining timer
-uint32_t try_to_reconnect = AP_TIMEOUT;
-bool tmr = 0;
+#ifdef WIFI_CONFIG_DEBUG
+#define DEBUG(message, ...) printf("*** wifi_config: " message "\n", ##__VA_ARGS__);
+#else
+#define DEBUG(message, ...)
+#endif
+
 
 typedef enum {
     ENDPOINT_UNKNOWN = 0,
@@ -41,17 +48,18 @@ typedef enum {
 typedef struct {
     char *ssid_prefix;
     char *password;
-    void (*on_wifi_ready)();
+    char *custom_html;
+    void (*on_wifi_ready)();  // deprecated
+    void (*on_event)(wifi_config_event_t);
 
-    TickType_t connect_start_time;
-    ETSTimer sta_connect_timeout;
+    int first_time;
+    ETSTimer network_monitor_timer;
     TaskHandle_t http_task_handle;
     TaskHandle_t dns_task_handle;
 } wifi_config_context_t;
 
 
-static wifi_config_context_t *context;
-
+static wifi_config_context_t *context = NULL;
 
 typedef struct _client {
     int fd;
@@ -63,6 +71,7 @@ typedef struct _client {
 } client_t;
 
 
+static int wifi_config_has_configuration();
 static int wifi_config_station_connect();
 static void wifi_config_softap_start();
 static void wifi_config_softap_stop();
@@ -207,8 +216,18 @@ static void wifi_config_server_on_settings(client_t *client) {
     client_send(client, http_prologue, sizeof(http_prologue)-1);
     client_send_chunk(client, html_settings_header);
 
-    char buffer[64];
+    if (context->custom_html != NULL && context->custom_html[0] > 0) {
+	uint8_t buffer_size = strlen(html_settings_custom_html) + strlen(context->custom_html); 
+	char* buffer = (char*) calloc(buffer_size, sizeof(char)); //fill up the buffer with zeros
+	snprintf(buffer, buffer_size, html_settings_custom_html, context->custom_html); //fill in template with the custom_html content
+	client_send_chunk(client, buffer); 
+	free(buffer);
+    }
+
+    client_send_chunk(client, html_settings_body);
+
     if (xSemaphoreTake(wifi_networks_mutex, 5000 / portTICK_PERIOD_MS)) {
+	char buffer[64];
         wifi_network_info_t *net = wifi_networks;
         while (net) {
             snprintf(
@@ -234,13 +253,15 @@ static void wifi_config_server_on_settings_update(client_t *client) {
 
     form_param_t *form = form_params_parse((char *)client->body);
     if (!form) {
+        DEBUG("Couldn't parse form data, redirecting to /settings");
         client_send_redirect(client, 302, "/settings");
         return;
     }
 
     form_param_t *ssid_param = form_params_find(form, "ssid");
     form_param_t *password_param = form_params_find(form, "password");
-    if (!ssid_param || !password_param) {
+    if (!ssid_param) {
+        DEBUG("Invalid form data, redirecting to /settings");
         form_params_free(form);
         client_send_redirect(client, 302, "/settings");
         return;
@@ -249,8 +270,15 @@ static void wifi_config_server_on_settings_update(client_t *client) {
     static const char payload[] = "HTTP/1.1 204 \r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     client_send(client, payload, sizeof(payload)-1);
 
+    DEBUG("Setting wifi_ssid param = %s", ssid_param->value);
+    DEBUG("Setting wifi_password param = %s", password_param->value);
+
     sysparam_set_string("wifi_ssid", ssid_param->value);
-    sysparam_set_string("wifi_password", password_param->value);
+    if (password_param) {
+        sysparam_set_string("wifi_password", password_param->value);
+    } else {
+        sysparam_set_string("wifi_password", "");
+    }
     form_params_free(form);
 
     vTaskDelay(500 / portTICK_PERIOD_MS);
@@ -277,7 +305,7 @@ static int wifi_config_server_on_url(http_parser *parser, const char *data, size
 
     if (client->endpoint == ENDPOINT_UNKNOWN) {
         char *url = strndup(data, length);
-        ERROR("Unknown endpoint: %s %s", http_method_str(parser->method), url);
+        DEBUG("Got HTTP request: %s %s", http_method_str(parser->method), url);
         free(url);
     }
 
@@ -301,19 +329,22 @@ static int wifi_config_server_on_message_complete(http_parser *parser) {
 
     switch(client->endpoint) {
         case ENDPOINT_INDEX: {
+            DEBUG("GET / -> redirecting to /settings");
             client_send_redirect(client, 301, "/settings");
             break;
         }
         case ENDPOINT_SETTINGS: {
+            DEBUG("GET /settings");
             wifi_config_server_on_settings(client);
             break;
         }
         case ENDPOINT_SETTINGS_UPDATE: {
+            DEBUG("POST /settings");
             wifi_config_server_on_settings_update(client);
             break;
         }
         case ENDPOINT_UNKNOWN: {
-            DEBUG("Unknown endpoint");
+            DEBUG("Unknown endpoint -> redirecting to http://192.168.4.1/settings");
             client_send_redirect(client, 302, "http://192.168.4.1/settings");
             break;
         }
@@ -337,7 +368,7 @@ static http_parser_settings wifi_config_http_parser_settings = {
 
 
 static void http_task(void *arg) {
-    INFO("Staring HTTP server");
+    INFO("Starting HTTP server");
 
     struct sockaddr_in serv_addr;
     int listenfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -408,7 +439,7 @@ static void http_task(void *arg) {
             }
         }
 
-        INFO("Client disconnected");
+        DEBUG("Client disconnected");
 
         lwip_close(client->fd);
         client_free(client);
@@ -500,6 +531,7 @@ static void dns_task(void *arg)
             *head++ = ip4_addr3(&server_addr);
             *head++ = ip4_addr4(&server_addr);
 
+            DEBUG("Got DNS query, sending response");
             sendto(fd, buffer, reply_len, 0, &src_addr, src_addr_len);
         }
 
@@ -531,38 +563,8 @@ static void dns_stop() {
 }
 
 
-static void wifi_config_context_free(wifi_config_context_t *context) {
-    if (context->ssid_prefix)
-        free(context->ssid_prefix);
-
-    if (context->password)
-        free(context->password);
-
-    free(context);
-}
-
-static void wifi_config_re_connect() {
-    try_to_reconnect--;
-    if (try_to_reconnect == 0) {
-        try_to_reconnect = AP_TIMEOUT;
-        sdk_os_timer_disarm(&r_timer);
-        printf("r_timer - time is up\n");
-        if (wifi_config_station_connect()) {
-            wifi_config_softap_start();
-            tmr = 1;
-        }
-    }
-}
-
 static void wifi_config_softap_start() {
     INFO("Starting AP mode");
-
-    if (tmr == 0) {
-      //Setup network reconnect timeout
-      sdk_os_timer_setfn(&r_timer, wifi_config_re_connect, NULL);
-      sdk_os_timer_arm(&r_timer, 1000, 1);
-      printf("r_timer started\n");
-    }
 
     sdk_wifi_set_opmode(STATIONAP_MODE);
 
@@ -570,12 +572,12 @@ static void wifi_config_softap_start() {
     sdk_wifi_get_macaddr(SOFTAP_IF, macaddr);
 
     struct sdk_softap_config softap_config;
+    sdk_wifi_softap_get_config(&softap_config);
     softap_config.ssid_len = snprintf(
         (char *)softap_config.ssid, sizeof(softap_config.ssid),
         "%s-%02X%02X%02X", context->ssid_prefix, macaddr[3], macaddr[4], macaddr[5]
     );
     softap_config.ssid_hidden = 0;
-    softap_config.channel = 3;
     if (context->password) {
         softap_config.authmode = AUTH_WPA_WPA2_PSK;
         strncpy((char *)softap_config.password,
@@ -588,16 +590,7 @@ static void wifi_config_softap_start() {
 
     DEBUG("Starting AP SSID=%s", softap_config.ssid);
 
-    struct ip_info ap_ip;
-    IP4_ADDR(&ap_ip.ip, 192, 168, 4, 1);
-    IP4_ADDR(&ap_ip.netmask, 255, 255, 255, 0);
-    IP4_ADDR(&ap_ip.gw, 0, 0, 0, 0);
-    sdk_wifi_set_ip_info(SOFTAP_IF, &ap_ip);
-
     sdk_wifi_softap_set_config(&softap_config);
-
-    ip4_addr_t first_client_ip;
-    first_client_ip.addr = ap_ip.ip.addr + htonl(1);
 
     wifi_networks_mutex = xSemaphoreCreateBinary();
     xSemaphoreGive(wifi_networks_mutex);
@@ -605,6 +598,15 @@ static void wifi_config_softap_start() {
     xTaskCreate(wifi_scan_task, "wifi_config scan", 384, NULL, 2, NULL);
 
     INFO("Starting DHCP server");
+    struct ip_info ap_ip;
+    IP4_ADDR(&ap_ip.ip, 192, 168, 4, 1);
+    IP4_ADDR(&ap_ip.netmask, 255, 255, 255, 0);
+    IP4_ADDR(&ap_ip.gw, 0, 0, 0, 0);
+    sdk_wifi_set_ip_info(SOFTAP_IF, &ap_ip);
+
+    ip4_addr_t first_client_ip;
+    first_client_ip.addr = ap_ip.ip.addr + htonl(1);
+
     dhcpserver_start(&first_client_ip, 4);
     dhcpserver_set_router(&ap_ip.ip);
     dhcpserver_set_dns(&ap_ip.ip);
@@ -622,32 +624,59 @@ static void wifi_config_softap_stop() {
 }
 
 
-static void wifi_config_sta_connect_timeout_callback(void *arg) {
-
+static void wifi_config_monitor_callback(void *arg) {
     if (sdk_wifi_station_get_connect_status() == STATION_GOT_IP) {
+        if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time)
+            return;
+
         // Connected to station, all is dandy
-        DEBUG("Successfully connected");
-        sdk_os_timer_disarm(&context->sta_connect_timeout);
-        sdk_os_timer_disarm(&r_timer);
+        INFO("Connected to WiFi network");
 
         wifi_config_softap_stop();
-        if (context->on_wifi_ready)
-            context->on_wifi_ready();
-        wifi_config_context_free(context);
-        context = NULL;
+        sdk_wifi_station_set_auto_connect(false);
+
+        if (context->on_event)
+            context->on_event(WIFI_CONFIG_CONNECTED);
+
+        context->first_time = false;
+
+        // change monitoring poll interval
+        sdk_os_timer_arm(&context->network_monitor_timer,
+                         WIFI_CONFIG_CONNECTED_MONITOR_INTERVAL, 1);
+
         return;
+    } else {
+        if (wifi_config_has_configuration())
+            wifi_config_station_connect();
+
+        if (sdk_wifi_get_opmode() != STATION_MODE)
+            return;
+
+        INFO("Disconnected from WiFi network");
+
+        if (!context->first_time && context->on_event)
+            context->on_event(WIFI_CONFIG_DISCONNECTED);
+
+        // change monitoring poll interval
+        sdk_os_timer_arm(&context->network_monitor_timer,
+                         WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL, 1);
+
+        wifi_config_softap_start();
+    }
+}
+
+
+static int wifi_config_has_configuration() {
+    char *wifi_ssid = NULL;
+    sysparam_get_string("wifi_ssid", &wifi_ssid);
+
+    if (!wifi_ssid) {
+        return 0;
     }
 
-    if ((xTaskGetTickCount() - context->connect_start_time) * portTICK_PERIOD_MS < WIFI_CONFIG_CONNECT_TIMEOUT) {
-        // Still have time, continue trying
-        return;
-    }
+    free(wifi_ssid);
 
-    sdk_os_timer_disarm(&context->sta_connect_timeout);
-    DEBUG("Timeout connecting to WiFi network, starting config AP");
-    // Not connected to station, launch configuration AP
-    tmr = 0;
-    wifi_config_softap_start();
+    return 1;
 }
 
 
@@ -658,13 +687,13 @@ static int wifi_config_station_connect() {
     sysparam_get_string("wifi_password", &wifi_password);
 
     if (!wifi_ssid) {
-        DEBUG("No configuration found");
+        ERROR("No configuration found");
         if (wifi_password)
             free(wifi_password);
         return -1;
     }
 
-    INFO("Found configuration, connecting to %s", wifi_ssid);
+    INFO("Connecting to %s", wifi_ssid);
 
     struct sdk_station_config sta_config;
     memset(&sta_config, 0, sizeof(sta_config));
@@ -682,11 +711,36 @@ static int wifi_config_station_connect() {
     if (wifi_password)
         free(wifi_password);
 
-    context->connect_start_time = xTaskGetTickCount();
-    sdk_os_timer_setfn(&context->sta_connect_timeout, wifi_config_sta_connect_timeout_callback, context);
-    sdk_os_timer_arm(&context->sta_connect_timeout, 500, 1);
-
     return 0;
+}
+
+
+void wifi_config_start() {
+    sdk_wifi_set_opmode(STATION_MODE);
+
+    context->first_time = true;
+
+    if (wifi_config_station_connect()) {
+        wifi_config_softap_start();
+    }
+
+    sdk_os_timer_setfn(&context->network_monitor_timer, wifi_config_monitor_callback, NULL);
+    sdk_os_timer_arm(&context->network_monitor_timer,
+                     WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL, 1);
+}
+
+
+void wifi_config_legacy_support_on_event(wifi_config_event_t event) {
+    if (event == WIFI_CONFIG_CONNECTED) {
+        if (context->on_wifi_ready) {
+            context->on_wifi_ready();
+        }
+    }
+#ifndef WIFI_CONFIG_NO_RESTART
+    else if (event == WIFI_CONFIG_DISCONNECTED) {
+        sdk_system_restart();
+    }
+#endif
 }
 
 
@@ -705,11 +759,31 @@ void wifi_config_init(const char *ssid_prefix, const char *password, void (*on_w
         context->password = strdup(password);
 
     context->on_wifi_ready = on_wifi_ready;
+    context->on_event = wifi_config_legacy_support_on_event;
 
-    if (wifi_config_station_connect()) {
-        tmr = 0;
-        wifi_config_softap_start();
+    wifi_config_start();
+}
+
+
+void wifi_config_init2(const char *ssid_prefix, const char *password,
+                       void (*on_event)(wifi_config_event_t))
+{
+    INFO("Initializing WiFi config");
+    if (password && strlen(password) < 8) {
+        ERROR("Password should be at least 8 characters");
+        return;
     }
+
+    context = malloc(sizeof(wifi_config_context_t));
+    memset(context, 0, sizeof(*context));
+
+    context->ssid_prefix = strndup(ssid_prefix, 33-7);
+    if (password)
+        context->password = strdup(password);
+
+    context->on_event = on_event;
+
+    wifi_config_start();
 }
 
 
@@ -720,12 +794,24 @@ void wifi_config_reset() {
 
 
 void wifi_config_get(char **ssid, char **password) {
-    sysparam_get_string("wifi_ssid", ssid);
-    sysparam_get_string("wifi_password", password);
+    if (ssid)
+        sysparam_get_string("wifi_ssid", ssid);
+
+    if (password)
+        sysparam_get_string("wifi_password", password);
 }
 
 
 void wifi_config_set(const char *ssid, const char *password) {
     sysparam_set_string("wifi_ssid", ssid);
     sysparam_set_string("wifi_password", password);
+}
+
+void wifi_config_set_custom_html(char *html) {
+    if (context == NULL) { 
+        ERROR("Cannot set custom html content, WiFi configuration not initialised yet");
+        return;
+    }
+
+    context->custom_html = html;
 }
